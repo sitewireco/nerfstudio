@@ -101,6 +101,8 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
     """If --use-sfm-depth and this flag is True, also export debug images showing Sf overlaid upon input images."""
     same_dimensions: bool = True
     """Whether to assume all images are same dimensions and so to use fast downscaling with no autorotation."""
+    colmap_mapper: Literal["mapper", "hierarchical_mapper"] = "mapper"
+    """Which colmap mapper to use"""
 
     @staticmethod
     def default_colmap_path() -> Path:
@@ -211,6 +213,7 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
                 matching_method=self.matching_method,
                 refine_intrinsics=self.refine_intrinsics,
                 colmap_cmd=self.colmap_cmd,
+                colmap_mapper=self.colmap_mapper
             )
         elif sfm_tool == "hloc":
             if mask_path is not None:
