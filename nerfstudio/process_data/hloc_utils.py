@@ -107,6 +107,14 @@ def run_hloc(
     feature_conf = extract_features.confs[feature_type]  # type: ignore
     matcher_conf = match_features.confs[matcher_type]  # type: ignore
 
+    # Custom Sitewire feature and matcher configuration for disk+lightglue
+    if feature_type == "disk":
+        feature_conf["model"]["max_keypoints"] = 8000
+        feature_conf["preprocessing"]["resize_max"] = 1376
+    if matcher_type == "disk+lightglue":
+        matcher_conf["model"]["sinkhorn_iterations"] = 50
+        matcher_conf["model"]["weights"] = "indoor"
+
     references = [p.relative_to(image_dir).as_posix() for p in image_dir.iterdir()]
     extract_features.main(feature_conf, image_dir, image_list=references, feature_path=features)  # type: ignore
     if matching_method == "exhaustive":
