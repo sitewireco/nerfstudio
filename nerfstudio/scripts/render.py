@@ -685,6 +685,189 @@ class SpiralRender(BaseRender):
             check_occlusions=self.check_occlusions,
         )
 
+def calculate_camera_to_world_matrix(eye, target, up):
+    forward = (target - eye) / torch.norm(target - eye, dim=1, keepdim=True)
+    right = torch.cross(up.expand_as(forward), forward)
+    right /= torch.norm(right, dim=1, keepdim=True)
+    up = torch.cross(forward, right)
+    # Create rotation matrices
+    rotation_matrices = torch.stack([right, up, -forward], dim=-1)
+    # Flip the z and y axes to align with gsplat conventions
+    r_edit = torch.diag(torch.tensor([-1., -1., -1.], device=rotation_matrices.device))
+    r_edit = r_edit.unsqueeze(0).repeat(rotation_matrices.size(0), 1, 1)
+    rotation_matrices = torch.einsum('bij,bjk->bik', rotation_matrices, r_edit)
+
+    # Create translation matrices
+    translation_matrices = torch.eye(4).repeat(rotation_matrices.size(0), 1, 1)
+    translation_matrices[:, :3, 3] = -eye
+
+    # Combine rotation and translation matrices
+    camera_to_world_matrices = torch.eye(4).repeat(rotation_matrices.size(0), 1, 1)  # Initialize with identity matrices
+    camera_to_world_matrices[:, :3, :3] = rotation_matrices
+    camera_to_world_matrices = torch.einsum('bij,bjk->bik', camera_to_world_matrices, translation_matrices)
+
+    return camera_to_world_matrices
+
+# Function to create a rotation matrix around the y-axis
+def rotation_matrix_y(angles, device):
+    cos_angles = torch.cos(angles)
+    sin_angles = torch.sin(angles)
+    rotation_matrices = torch.zeros((angles.shape[0], 3, 3), device=device)
+    rotation_matrices[:, 0, 0] = cos_angles
+    rotation_matrices[:, 0, 2] = sin_angles
+    rotation_matrices[:, 1, 1] = 1
+    rotation_matrices[:, 2, 0] = -sin_angles
+    rotation_matrices[:, 2, 2] = cos_angles
+    return rotation_matrices
+
+def get_pose_view_cameras(transformation_matrix, scale_factor, eye, target, start_angle, end_angle, intermediate_steps, device, camera):
+    transformation_matrix = torch.tensor(transformation_matrix, device=device)
+    transformation_matrix = torch.cat((transformation_matrix, torch.tensor([[0, 0, 0, 1]], device=device)), dim=0)   # Homogeneous coordinate
+    # Apply scale to transformation matrix
+    scaled_transformation_matrix = transformation_matrix * scale_factor
+
+    eye = torch.tensor(eye, device=device)
+    target = torch.tensor(target, device=device)
+
+
+    # Generate views by rotating around the y-axis in the world coordinate system and transform these rotated targets into the NeRF coordinate system afterwards
+    start_angle = np.deg2rad(start_angle)
+    end_angle = np.deg2rad(end_angle)
+    angles = torch.linspace(start_angle, end_angle, intermediate_steps)
+    # Create rotation matrices for all angles in parallel
+    rotation_matrices = rotation_matrix_y(angles, device)
+    # Rotate the target vector around the eye position
+    rotated_targets = torch.einsum('ijk,k->ij', rotation_matrices, target - eye) + eye
+
+    # Transform the eye into NeRF coordinate system
+    eye_nerf = torch.cat((eye, torch.tensor([1.0], device=device))) # Homogeneous coordinate
+    eye_nerf = scaled_transformation_matrix @ eye_nerf
+    eye_nerf = eye_nerf[:-1] # Remove homogeneous component
+
+    # Transform the rotated_targets into the NeRF coordinate system
+    rotated_targets_nerf = torch.cat((rotated_targets, torch.ones_like(rotated_targets[:, :1], device=device)), dim=1) # Homogeneous coordinate
+    # scaled_transformation_matrix.unsqueeze(0) adds a new dimension at the beginning of scaled_transformation_matrix, making it a 1x4x4 tensor.
+    # .expand(rotated_targets_nerf.size(0), -1, -1) expands the dimensions of scaled_transformation_matrix along the first axis to match the number of rows in rotated_targets_nerf, resulting in a intermediate_stepsx4x4 tensor.
+    expanded_scaled_transformation_matrix = scaled_transformation_matrix.unsqueeze(0).expand(rotated_targets_nerf.size(0), -1, -1)
+    # rotated_targets_nerf.unsqueeze(-1) adds a new singleton dimension at the end of rotated_targets_nerf, making it a intermediate_stepsx4x1 tensor, which is required for matrix multiplication.
+    rotated_targets_nerf = expanded_scaled_transformation_matrix @ rotated_targets_nerf.unsqueeze(-1)
+    # .squeeze(-1) removes the last singleton dimension from the result to get the final shape.
+    rotated_targets_nerf = rotated_targets_nerf.squeeze(-1)[:,:-1]
+
+    up = torch.tensor([0, 1., 0], device=device)  # Up vector
+    up = torch.cat((up, torch.tensor([1.0], device=device)))  # Corrected to pass a tuple to torch.cat
+    up_nerf = scaled_transformation_matrix @ up
+    up_nerf = up_nerf[:-1] # Remove homogeneous component
+
+    # Calculate camera-to-world matrices for all views
+    camera_to_world_matrices = calculate_camera_to_world_matrix(eye_nerf, rotated_targets_nerf, up_nerf)
+
+    # Set intrinsic parameters
+    fx = camera.fx.expand(intermediate_steps, -1)
+    fy = camera.fy.expand(intermediate_steps, -1)
+    cx = camera.cx.expand(intermediate_steps, -1)
+    cy = camera.cy.expand(intermediate_steps, -1)
+
+    width = camera.width.expand(intermediate_steps, -1)
+    height = camera.height.expand(intermediate_steps, -1)
+
+    distortion_params = camera.distortion_params.expand(intermediate_steps, -1) if camera.distortion_params is not None else None
+    camera_type = camera.camera_type.expand(intermediate_steps, -1)
+
+    times = camera.times.expand(intermediate_steps, -1) if camera.times is not None else None
+    metadata = camera.metadata if camera.metadata is not None else None
+
+    cameras = Cameras(camera_to_worlds=camera_to_world_matrices,fx=fx,fy=fy,cx=cx,cy=cy,width=width,height=height,distortion_params=distortion_params,camera_type=camera_type,times=times,metadata=metadata)
+    return cameras
+
+
+# Sourced from: https://github.com/nerfstudio-project/nerfstudio/issues/2811
+#
+# ns-render pose-view --output-format images --load-config outputs/room10/splatfacto/2024-04-20_203234/config.yml --load-dataparser-transforms outputs/room10/splatfacto/2024-04-20_203234/dataparser_transforms.json --eye " 0.1  0.9 -0.2" --target "0 0.15 0"
+
+@dataclass
+class RenderPoseView(BaseRender):
+    """Rotate around a pose and render the corresponding views."""
+
+    pose_source: Literal["eval", "train"] = "eval"
+    """Pose source to render."""
+    interpolation_steps: int = 10
+    """Number of interpolation steps between eval dataset cameras."""
+    order_poses: bool = False
+    """Whether to order camera poses by proximity."""
+    frame_rate: int = 24
+    """Frame rate of the output video."""
+    output_format: Literal["images", "video"] = "video"
+    """How to save output data."""
+
+    eye: str = ""
+    """Eye of the pose to render of shape "x y z" in the original data coordinate system."""
+    target: str = "[0, eye[1], 0]" #if not set, make it look towards the origin but in parallel to the floor
+    """Target of the pose to render of shape "x y z" in the original data coordinate system."""
+    start_angle: float = 0.0
+    """Start angle of the perspective relative to the origin."""
+    end_angle: float = 345.0
+    """End angle of the perspective relative to the origin."""
+    intermediate_steps: int = 20
+    """Number of intermediate steps of the arc that will be rendered."""
+    load_dataparser_transforms: Path = Path()
+    """Path to dataparser_transforms JSON file."""
+
+    def main(self) -> None:
+        """Main function."""
+        _, pipeline, _, step = eval_setup(
+            self.load_config,
+            eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
+            test_mode="test",
+        )
+
+        assert self.load_dataparser_transforms.is_file(), f"dataparser_transforms.json could not be found in {self.load_dataparser_transform}."
+        with open(self.load_dataparser_transforms) as f:
+            self.load_dataparser_transforms = json.load(f)
+            assert "transform" in self.load_dataparser_transforms, f"Transformation matrix could not be found in {self.load_dataparser_transform}."
+            assert "scale" in self.load_dataparser_transforms, f"Scale factor could not be found in {self.load_dataparser_transform}."
+            self.transform = self.load_dataparser_transforms["transform"]
+            assert len(self.transform) == 3, f"Transformation matrix must be of shape [3 4]."
+            assert len(self.transform[0]) == 4, f"Transformation matrix must be of shape [3 4]."
+            self.scale = self.load_dataparser_transforms["scale"]
+            assert type(self.scale) is float, f"Scale factor must be a scalar."
+        self.eye = [float(x) for x in self.eye.split()]
+        assert len(self.eye)==3, "Eye must be of shape \"x y z\" in the original data coordinate system."
+        self.target = [float(x) for x in self.target.split()] if self.target != "[0, eye[1], 0]" else [0, self.eye[1], 0]
+        assert len(self.target)==3, "Target must be of shape \"x y z\" in the original data coordinate system."
+        assert self.start_angle <= self.end_angle, "The start angle must be less than or equal to the end angle."
+        assert self.start_angle > -360, "The start angle must not exceed -360 degrees."
+        assert self.end_angle < 360, "The end angle must not exceed 360 degrees."
+
+
+        if self.pose_source == "eval":
+            assert pipeline.datamanager.eval_dataset is not None
+            camera, _ = pipeline.datamanager.next_eval(step)
+        else:
+            assert pipeline.datamanager.train_dataset is not None
+            camera, _ = pipeline.datamanager.next_train(step)
+
+        pose_view_cameras = get_pose_view_cameras(self.transform, self.scale, self.eye, self.target, self.start_angle, self.end_angle, self.intermediate_steps, pipeline.device, camera)
+        install_checks.check_ffmpeg_installed()
+
+        seconds = self.intermediate_steps * len(pose_view_cameras) / self.frame_rate
+
+        _render_trajectory_video(
+            pipeline,
+            pose_view_cameras,
+            output_filename=self.output_path,
+            rendered_output_names=self.rendered_output_names,
+            rendered_resolution_scaling_factor=1.0 / self.downscale_factor,
+            seconds=seconds,
+            output_format=self.output_format,
+            image_format=self.image_format,
+            depth_near_plane=self.depth_near_plane,
+            depth_far_plane=self.depth_far_plane,
+            colormap_options=self.colormap_options,
+            render_nearest_camera=self.render_nearest_camera,
+            check_occlusions=self.check_occlusions,
+        )
+
 
 @contextmanager
 def _disable_datamanager_setup(cls):
@@ -885,6 +1068,7 @@ Commands = tyro.conf.FlagConversionOff[
     Union[
         Annotated[RenderCameraPath, tyro.conf.subcommand(name="camera-path")],
         Annotated[RenderInterpolated, tyro.conf.subcommand(name="interpolate")],
+        Annotated[RenderPoseView, tyro.conf.subcommand(name="pose-view")],
         Annotated[SpiralRender, tyro.conf.subcommand(name="spiral")],
         Annotated[DatasetRender, tyro.conf.subcommand(name="dataset")],
     ]
@@ -904,3 +1088,14 @@ if __name__ == "__main__":
 def get_parser_fn():
     """Get the parser function for the sphinx docs."""
     return tyro.extras.get_parser(Commands)  # noqa
+def run_command(cmd: str, verbose=False) -> Optional[str]:
+    """Run a command in the shell."""
+    import subprocess
+
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if verbose:
+        print(result.stdout)
+    if result.returncode != 0:
+        print(result.stderr)
+        return None
+    return result.stdout.strip()
