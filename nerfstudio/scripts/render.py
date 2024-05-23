@@ -719,7 +719,7 @@ def rotation_matrix_y(angles, device):
     rotation_matrices[:, 2, 2] = cos_angles
     return rotation_matrices
 
-def get_pose_view_cameras(transformation_matrix, scale_factor, eye, target, start_angle, end_angle, intermediate_steps, device, camera):
+def get_pose_view_cameras(transformation_matrix, scale_factor, eye, target, start_angle, end_angle, intermediate_steps, device, camera, up=None):
     transformation_matrix = torch.tensor(transformation_matrix, device=device)
     transformation_matrix = torch.cat((transformation_matrix, torch.tensor([[0, 0, 0, 1]], device=device)), dim=0)   # Homogeneous coordinate
     # Apply scale to transformation matrix
@@ -753,8 +753,11 @@ def get_pose_view_cameras(transformation_matrix, scale_factor, eye, target, star
     # .squeeze(-1) removes the last singleton dimension from the result to get the final shape.
     rotated_targets_nerf = rotated_targets_nerf.squeeze(-1)[:,:-1]
 
-    up = torch.tensor([0, 1., 0], device=device)  # Up vector
-    up = torch.cat((up, torch.tensor([1.0], device=device)))  # Corrected to pass a tuple to torch.cat
+    if up is None:
+        up = torch.tensor([0, 1., 0], device=device)  # Default up vector
+    else:
+        up = torch.tensor(up, device=device)  # Use provided up vector
+    up = torch.cat((up, torch.tensor([1.0], device=device)))  # Homogeneous coordinate
     up_nerf = scaled_transformation_matrix @ up
     up_nerf = up_nerf[:-1] # Remove homogeneous component
 
@@ -1063,16 +1066,146 @@ class DatasetRender(BaseRender):
         CONSOLE.print(Panel(table, title="[bold][green]:tada: Render on split {} Complete :tada:[/bold]", expand=False))
 
 
+@dataclass
+class RenderCubeMap(BaseRender):
+    """Render images for the six axis directions to create a cubemap."""
+
+    pose_source: Literal["eval", "train"] = "eval"
+    """Pose source to render."""
+    frame_rate: int = 24
+    """Frame rate of the output video."""
+    output_format: Literal["images", "video"] = "images"
+    """How to save output data."""
+
+    eye: str = "0 0.2 0"
+    """Eye of the pose to render of shape "x y z" in the original data coordinate system."""
+    start_angle: float = 0.0
+    """End angle of the perspective relative to the origin."""
+    intermediate_steps: int = 1
+    """Number of intermediate steps of the arc that will be rendered."""
+    load_dataparser_transforms: Path = Path()
+    """Path to dataparser_transforms JSON file."""
+    image_format: str = "png"
+    """Output image format."""
+    image_size: int = 800
+    """Output image size."""
+
+    def main(self) -> None:
+        """Main function."""
+        _, pipeline, _, step = eval_setup(
+            self.load_config,
+            eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
+            test_mode="test",
+        )
+
+        assert self.load_dataparser_transforms.is_file(), f"dataparser_transforms.json could not be found in {self.load_dataparser_transform}."
+        with open(self.load_dataparser_transforms) as f:
+            self.load_dataparser_transforms = json.load(f)
+            assert "transform" in self.load_dataparser_transforms, f"Transformation matrix could not be found in {self.load_dataparser_transform}."
+            assert "scale" in self.load_dataparser_transforms, f"Scale factor could not be found in {self.load_dataparser_transform}."
+            self.transform = self.load_dataparser_transforms["transform"]
+            assert len(self.transform) == 3, f"Transformation matrix must be of shape [3 4]."
+            assert len(self.transform[0]) == 4, f"Transformation matrix must be of shape [3 4]."
+            self.scale = self.load_dataparser_transforms["scale"]
+            assert type(self.scale) is float, f"Scale factor must be a scalar."
+        self.eye = [float(x) for x in self.eye.split()]
+        assert len(self.eye)==3, "Eye must be of shape \"x y z\" in the original data coordinate system."
+        assert self.start_angle > -360, "The start angle must not exceed -360 degrees."
+        self.end_angle = self.start_angle
+
+        if self.pose_source == "eval":
+            assert pipeline.datamanager.eval_dataset is not None
+            camera, _ = pipeline.datamanager.next_eval(step)
+        else:
+            assert pipeline.datamanager.train_dataset is not None
+            camera, _ = pipeline.datamanager.next_train(step)
+
+        install_checks.check_ffmpeg_installed()
+
+        self.output_path = self.output_path / "cubemap"
+        self.output_path.mkdir(parents=True, exist_ok=True)
+
+        x, y, z = self.eye
+        # XYZ coords schema
+        # directions = [
+        #     ([1, y, z], [x, y, 1]),  # Right
+        #     ([-1, y, z], [x, y, 1]), # Left
+        #     ([x, y, 1], [-1, y, z]), # Up
+        #     ([x, y, -1], [x, 1, z]), # Down
+        #     ([x, 1, z], [x, y, 1]),  # Front
+        #     ([x, -1, z], [x, y, 1]), # Back
+        # ]
+
+        # Directions are in Nerfstudio coords format [x,z,y]
+        directions = [
+            ([1, z, y], [x, 1, y]),  # Right
+            ([-1, z, y], [x, 1, y]), # Left
+            ([x, 1, y], [-1, z, y]), # Up
+            ([x, -1, y], [x, z, 1]), # Down
+            ([x, z, 1], [x, 1, y]),  # Front
+            ([x, z, -1], [x, 1, y]), # Back
+        ]
+
+        temp_dirs = []
+        for i, (target, up) in enumerate(directions):
+            temp_dir = self.output_path / f"temp_{i}"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            temp_dirs.append(temp_dir)
+
+            pose_view_cameras = get_pose_view_cameras(
+                self.transform, self.scale, self.eye, target, self.start_angle,
+                self.end_angle, self.intermediate_steps, pipeline.device, camera, up=up
+            )
+
+            # Set Output image size
+            pose_view_cameras.height[0] = self.image_size
+            pose_view_cameras.width[0] = self.image_size
+
+            # Set FOV to 90 degrees
+            fov = 90.0
+            min_extent = pose_view_cameras.width[0]
+            focal_length = min_extent / (2 * np.tan(np.deg2rad(fov)/2))
+            pose_view_cameras.fx[...] = focal_length
+            pose_view_cameras.fy[...] = focal_length
+
+            _render_trajectory_video(
+                pipeline,
+                pose_view_cameras,
+                output_filename=temp_dir / "render.mp4",
+                rendered_output_names=self.rendered_output_names,
+                rendered_resolution_scaling_factor=1.0,
+                seconds=self.intermediate_steps / self.frame_rate,
+                output_format=self.output_format,
+                image_format=self.image_format,
+                depth_near_plane=self.depth_near_plane,
+                depth_far_plane=self.depth_far_plane,
+                colormap_options=self.colormap_options,
+                render_nearest_camera=self.render_nearest_camera,
+                check_occlusions=self.check_occlusions,
+            )
+
+        extension_map = { "jpeg": "jpg", "png": "png" }
+        file_extension = extension_map.get(self.image_format)
+
+        for i, temp_dir in enumerate(temp_dirs):
+            shutil.copy(temp_dir / "render" / f"00000.{file_extension}", self.output_path / f"cube_{i}.{file_extension}")
+
+        # Clean up temp directories
+        for temp_dir in temp_dirs:
+            shutil.rmtree(temp_dir)
+
+        CONSOLE.print(Panel(f"[bold][green]:tada: Cubemap Render Complete :tada:[/bold]", expand=False))
+
 Commands = tyro.conf.FlagConversionOff[
     Union[
         Annotated[RenderCameraPath, tyro.conf.subcommand(name="camera-path")],
         Annotated[RenderInterpolated, tyro.conf.subcommand(name="interpolate")],
         Annotated[RenderPoseView, tyro.conf.subcommand(name="pose-view")],
+        Annotated[RenderCubeMap, tyro.conf.subcommand(name="cubemap")],
         Annotated[SpiralRender, tyro.conf.subcommand(name="spiral")],
         Annotated[DatasetRender, tyro.conf.subcommand(name="dataset")],
     ]
 ]
-
 
 def entrypoint():
     """Entrypoint for use with pyproject scripts."""
