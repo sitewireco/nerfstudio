@@ -1089,6 +1089,7 @@ class RenderCubeMap(BaseRender):
     """Output image format."""
     image_size: int = 800
     """Output image size."""
+    fov: float = None
 
     def main(self) -> None:
         """Main function."""
@@ -1161,12 +1162,11 @@ class RenderCubeMap(BaseRender):
             pose_view_cameras.height[0] = self.image_size
             pose_view_cameras.width[0] = self.image_size
 
-            # Set FOV to 90 degrees
-            fov = 90.0
-            min_extent = pose_view_cameras.width[0]
-            focal_length = min_extent / (2 * np.tan(np.deg2rad(fov)/2))
-            pose_view_cameras.fx[...] = focal_length
-            pose_view_cameras.fy[...] = focal_length
+            if self.fov != None:
+                min_extent = pose_view_cameras.width[0]
+                focal_length = min_extent / (2 * np.tan(np.deg2rad(self.fov)/2))
+                pose_view_cameras.fx[...] = focal_length
+                pose_view_cameras.fy[...] = focal_length
 
             _render_trajectory_video(
                 pipeline,
