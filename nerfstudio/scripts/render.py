@@ -1072,17 +1072,8 @@ class RenderCubeMap(BaseRender):
 
     pose_source: Literal["eval", "train"] = "eval"
     """Pose source to render."""
-    frame_rate: int = 24
-    """Frame rate of the output video."""
-    output_format: Literal["images", "video"] = "images"
-    """How to save output data."""
-
-    eye: str = "0 0.2 0"
+    eye: str = "0 0 0"
     """Eye of the pose to render of shape "x y z" in the original data coordinate system."""
-    start_angle: float = 0.0
-    """End angle of the perspective relative to the origin."""
-    intermediate_steps: int = 1
-    """Number of intermediate steps of the arc that will be rendered."""
     load_dataparser_transforms: Path = Path()
     """Path to dataparser_transforms JSON file."""
     image_format: str = "png"
@@ -1090,6 +1081,7 @@ class RenderCubeMap(BaseRender):
     image_size: int = 800
     """Output image size."""
     fov: float = None
+    """Output FOV in degrees"""
 
     def main(self) -> None:
         """Main function."""
@@ -1098,6 +1090,12 @@ class RenderCubeMap(BaseRender):
             eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
             test_mode="test",
         )
+
+        self.start_angle = 0.0
+        self.end_angle = 0.0
+        self.intermediate_steps = 1
+        self.frame_rate = 1
+        self.output_format = "images"
 
         assert self.load_dataparser_transforms.is_file(), f"dataparser_transforms.json could not be found in {self.load_dataparser_transform}."
         with open(self.load_dataparser_transforms) as f:
@@ -1111,8 +1109,6 @@ class RenderCubeMap(BaseRender):
             assert type(self.scale) is float, f"Scale factor must be a scalar."
         self.eye = [float(x) for x in self.eye.split()]
         assert len(self.eye)==3, "Eye must be of shape \"x y z\" in the original data coordinate system."
-        assert self.start_angle > -360, "The start angle must not exceed -360 degrees."
-        self.end_angle = self.start_angle
 
         if self.pose_source == "eval":
             assert pipeline.datamanager.eval_dataset is not None
@@ -1126,18 +1122,8 @@ class RenderCubeMap(BaseRender):
         self.output_path = self.output_path / "cubemap"
         self.output_path.mkdir(parents=True, exist_ok=True)
 
-        x, y, z = self.eye
-        # XYZ coords schema
-        # directions = [
-        #     ([1, y, z], [x, y, 1]),  # Right
-        #     ([-1, y, z], [x, y, 1]), # Left
-        #     ([x, y, 1], [-1, y, z]), # Up
-        #     ([x, y, -1], [x, 1, z]), # Down
-        #     ([x, 1, z], [x, y, 1]),  # Front
-        #     ([x, -1, z], [x, y, 1]), # Back
-        # ]
-
         # Directions are in Nerfstudio coords format [x,z,y]
+        x, y, z = self.eye
         directions = [
             ([1, z, y], [x, 1, y]),  # Right
             ([-1, z, y], [x, 1, y]), # Left
@@ -1184,7 +1170,7 @@ class RenderCubeMap(BaseRender):
                 check_occlusions=self.check_occlusions,
             )
 
-        extension_map = { "jpeg": "jpg", "png": "png" }
+        extension_map = { "jpg": "jpg", "jpeg": "jpg", "png": "png" }
         file_extension = extension_map.get(self.image_format)
 
         for i, temp_dir in enumerate(temp_dirs):
