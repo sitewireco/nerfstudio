@@ -1095,7 +1095,6 @@ class RenderCubeMap(BaseRender):
         self.end_angle = 0.0
         self.intermediate_steps = 1
         self.frame_rate = 1
-        self.output_format = "images"
 
         assert self.load_dataparser_transforms.is_file(), f"dataparser_transforms.json could not be found in {self.load_dataparser_transform}."
         with open(self.load_dataparser_transforms) as f:
@@ -1161,7 +1160,7 @@ class RenderCubeMap(BaseRender):
                 rendered_output_names=self.rendered_output_names,
                 rendered_resolution_scaling_factor=1.0,
                 seconds=self.intermediate_steps / self.frame_rate,
-                output_format=self.output_format,
+                output_format="images",
                 image_format=self.image_format,
                 depth_near_plane=self.depth_near_plane,
                 depth_far_plane=self.depth_far_plane,
