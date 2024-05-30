@@ -1080,8 +1080,10 @@ class RenderCubeMap(BaseRender):
     """Output image format."""
     image_size: int = 800
     """Output image size."""
-    fov: float = None
+    fov: float = 0.0
     """Output FOV in degrees"""
+    output_format: str = "images"
+    """Output format parameter is ignored"""
 
     def main(self) -> None:
         """Main function."""
@@ -1147,7 +1149,7 @@ class RenderCubeMap(BaseRender):
             pose_view_cameras.height[0] = self.image_size
             pose_view_cameras.width[0] = self.image_size
 
-            if self.fov != None:
+            if self.fov > 0.0:
                 min_extent = pose_view_cameras.width[0]
                 focal_length = min_extent / (2 * np.tan(np.deg2rad(self.fov)/2))
                 pose_view_cameras.fx[...] = focal_length
