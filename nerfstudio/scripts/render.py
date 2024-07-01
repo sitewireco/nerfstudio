@@ -1065,6 +1065,111 @@ class DatasetRender(BaseRender):
             table.add_row(f"Outputs {split}", str(self.output_path / split))
         CONSOLE.print(Panel(table, title="[bold][green]:tada: Render on split {} Complete :tada:[/bold]", expand=False))
 
+@dataclass
+class RenderEquiPano(BaseRender):
+    """Render images for the six axis directions to create a cubemap."""
+
+    pose_source: Literal["eval", "train"] = "eval"
+    """Pose source to render."""
+    eye: str = "0 0 0"
+    """Eye of the pose to render of shape "x y z" in the original data coordinate system."""
+    load_dataparser_transforms: Path = Path()
+    """Path to dataparser_transforms JSON file."""
+    image_format: str = "png"
+    """Output image format."""
+    image_size: int = 800
+    """Output image size."""
+    output_format: str = "images"
+    """Output format parameter is ignored"""
+
+    def main(self) -> None:
+        """Main function."""
+        _, pipeline, _, step = eval_setup(
+            self.load_config,
+            eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
+            test_mode="test",
+        )
+
+        self.output_format = "images"
+        self.start_angle = 0.0
+        self.end_angle = 0.0
+        self.intermediate_steps = 1
+        self.frame_rate = 1
+
+        assert self.load_dataparser_transforms.is_file(), f"dataparser_transforms.json could not be found in {self.load_dataparser_transform}."
+        with open(self.load_dataparser_transforms) as f:
+            self.load_dataparser_transforms = json.load(f)
+            assert "transform" in self.load_dataparser_transforms, f"Transformation matrix could not be found in {self.load_dataparser_transform}."
+            assert "scale" in self.load_dataparser_transforms, f"Scale factor could not be found in {self.load_dataparser_transform}."
+            self.transform = self.load_dataparser_transforms["transform"]
+            assert len(self.transform) == 3, f"Transformation matrix must be of shape [3 4]."
+            assert len(self.transform[0]) == 4, f"Transformation matrix must be of shape [3 4]."
+            self.scale = self.load_dataparser_transforms["scale"]
+            assert type(self.scale) is float, f"Scale factor must be a scalar."
+        self.eye = [float(x) for x in self.eye.split()]
+        assert len(self.eye)==3, "Eye must be of shape \"x y z\" in the original data coordinate system."
+
+        if self.pose_source == "eval":
+            assert pipeline.datamanager.eval_dataset is not None
+            camera, _ = pipeline.datamanager.next_eval(step)
+        else:
+            assert pipeline.datamanager.train_dataset is not None
+            camera, _ = pipeline.datamanager.next_train(step)
+
+        install_checks.check_ffmpeg_installed()
+
+        self.output_path = self.output_path / "equipano"
+        self.output_path.mkdir(parents=True, exist_ok=True)
+
+        x, y, z = self.eye
+
+        target = [x, z, 1]
+        up =  [x, 1, y]
+
+        temp_dir = self.output_path / f"temp_{i}"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_dirs.append(temp_dir)
+
+        pose_view_cameras = get_pose_view_cameras(
+            self.transform, self.scale, self.eye, target, self.start_angle,
+            self.end_angle, self.intermediate_steps, pipeline.device, camera, up=up
+        )
+
+        # Set Output image size
+        pose_view_cameras.height[0] = self.image_size
+        pose_view_cameras.width[0] = self.image_size * 2.0
+
+        x_fov = 360.0
+        y_fox = 180.0
+        x_extent = pose_view_cameras.width[0]
+        x_focal_length = x_extent / (2 * np.tan(np.deg2rad(x_fov)/2))
+        y_extent = pose_view_cameras.width[0]
+        y_focal_length = y_extent / (2 * np.tan(np.deg2rad(y_fov)/2))
+        pose_view_cameras.fx[...] = x_focal_length
+        pose_view_cameras.fy[...] = y_focal_length
+
+        _render_trajectory_video(
+            pipeline,
+            pose_view_cameras,
+            output_filename=temp_dir / "render.mp4",
+            rendered_output_names=self.rendered_output_names,
+            rendered_resolution_scaling_factor=1.0,
+            seconds=self.intermediate_steps / self.frame_rate,
+            output_format=self.output_format,
+            image_format=self.image_format,
+            depth_near_plane=self.depth_near_plane,
+            depth_far_plane=self.depth_far_plane,
+            colormap_options=self.colormap_options,
+            render_nearest_camera=self.render_nearest_camera,
+            check_occlusions=self.check_occlusions,
+        )
+
+        extension_map = { "jpg": "jpg", "jpeg": "jpg", "png": "png" }
+        file_extension = extension_map.get(self.image_format)
+        shutil.copy(temp_dir / "render" / f"00000.{file_extension}", self.output_path / f"equipano.{file_extension}")
+        shutil.rmtree(temp_dir)
+
+        CONSOLE.print(Panel(f"[bold][green]:tada: Cubemap Render Complete :tada:[/bold]", expand=False))
 
 @dataclass
 class RenderCubeMap(BaseRender):
@@ -1190,6 +1295,7 @@ Commands = tyro.conf.FlagConversionOff[
         Annotated[RenderInterpolated, tyro.conf.subcommand(name="interpolate")],
         Annotated[RenderPoseView, tyro.conf.subcommand(name="pose-view")],
         Annotated[RenderCubeMap, tyro.conf.subcommand(name="cubemap")],
+        Annotated[RenderEquiPano, tyro.conf.subcommand(name="equipano")],
         Annotated[SpiralRender, tyro.conf.subcommand(name="spiral")],
         Annotated[DatasetRender, tyro.conf.subcommand(name="dataset")],
     ]
