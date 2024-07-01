@@ -99,7 +99,6 @@ def run_colmap(
     matching_method: Literal["vocab_tree", "exhaustive", "sequential"] = "vocab_tree",
     refine_intrinsics: bool = True,
     colmap_cmd: str = "colmap",
-    colmap_mapper: Literal["mapper", "hierarchical_mapper"] = "mapper"
 ) -> None:
     """Runs COLMAP on the images.
 
@@ -113,7 +112,6 @@ def run_colmap(
         matching_method: Matching method to use.
         refine_intrinsics: If True, refine intrinsics.
         colmap_cmd: Path to the COLMAP executable.
-        colmap_mapper: use colmap 'mapper' or 'hierarchical_mapper'
     """
 
     colmap_version = get_colmap_version(colmap_cmd)
@@ -156,7 +154,7 @@ def run_colmap(
     sparse_dir = colmap_dir / "sparse"
     sparse_dir.mkdir(parents=True, exist_ok=True)
     mapper_cmd = [
-        f"{colmap_cmd} {colmap_mapper}",
+        f"{colmap_cmd} mapper",
         f"--database_path {colmap_dir / 'database.db'}",
         f"--image_path {image_dir}",
         f"--output_path {sparse_dir}",
@@ -174,34 +172,16 @@ def run_colmap(
         run_command(mapper_cmd, verbose=verbose)
     CONSOLE.log("[bold green]:tada: Done COLMAP bundle adjustment.")
 
-    if colmap_mapper == "hierarchical_mapper":
-        refine_intrinsics = True
-        iterations = 3
-        for iteration in range(iterations):
-            with status(msg="[bold yellow]Point triangulation...", spinner="dqpb", verbose=verbose):
-                triangle_adjuster_cmd = [
-                    f"{colmap_cmd} point_triangulator",
-                    f"--input_path {sparse_dir}/0",
-                    f"--output_path {sparse_dir}/0",
-                ]
-                run_command(" ".join(triangle_adjuster_cmd), verbose=verbose)
-            CONSOLE.log("[bold green]:tada: Done with point triangulation.")
-
     if refine_intrinsics:
-        if colmap_mapper == "mapper":
-            iterations = 1
-        else:
-            iterations = 3
-        for iteration in range(iterations):
-            with status(msg="[bold yellow]Refine intrinsics...", spinner="dqpb", verbose=verbose):
-                bundle_adjuster_cmd = [
-                    f"{colmap_cmd} bundle_adjuster",
-                    f"--input_path {sparse_dir}/0",
-                    f"--output_path {sparse_dir}/0",
-                    "--BundleAdjustment.refine_principal_point 1",
-                ]
-                run_command(" ".join(bundle_adjuster_cmd), verbose=verbose)
-            CONSOLE.log("[bold green]:tada: Done refining intrinsics.")
+        with status(msg="[bold yellow]Refine intrinsics...", spinner="dqpb", verbose=verbose):
+            bundle_adjuster_cmd = [
+                f"{colmap_cmd} bundle_adjuster",
+                f"--input_path {sparse_dir}/0",
+                f"--output_path {sparse_dir}/0",
+                "--BundleAdjustment.refine_principal_point 1",
+            ]
+            run_command(" ".join(bundle_adjuster_cmd), verbose=verbose)
+        CONSOLE.log("[bold green]:tada: Done refining intrinsics.")
 
 
 def parse_colmap_camera_params(camera) -> Dict[str, Any]:
