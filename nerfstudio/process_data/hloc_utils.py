@@ -165,5 +165,7 @@ def run_hloc(
             matches,
             camera_mode=camera_mode,  # type: ignore
             image_options=image_options,
+            mapper_options={"ba_global_max_num_iterations":20, "ba_global_max_refinements":2,
+                             "ba_global_function_tolerance":1e-4, "ba_local_function_tolerance":1e-4},
             verbose=verbose,
         )
